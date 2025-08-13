@@ -1,0 +1,86 @@
+# Copyright 2024 DeepMind Technologies Limited
+#
+# AlphaFold 3 source code is licensed under CC BY-NC-SA 4.0. To view a copy of
+# this license, visit https://creativecommons.org/licenses/by-nc-sa/4.0/
+#
+# To request access to the AlphaFold 3 model parameters, follow the process set
+# out at https://github.com/google-deepmind/alphafold3. You may only use these
+# if received directly from Google. Use is subject to terms of use available at
+# https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md
+
+FROM nvidia/cuda:12.9.0-base-ubuntu24.04
+
+
+# 1) Install system build tools, MLIR & ninja
+RUN apt update --quiet \
+ && DEBIAN_FRONTEND=noninteractive apt install --yes --quiet \
+      software-properties-common \
+      git wget \
+      gcc g++ make \
+      zlib1g-dev zstd \
+      cmake ninja-build \
+      libmlir-15-dev mlir-15-tools llvm-15-dev \
+ && rm -rf /var/lib/apt/lists/*
+
+# 2) Install Python 3.11 and uv
+RUN add-apt-repository ppa:deadsnakes/ppa \
+ && DEBIAN_FRONTEND=noninteractive apt update --quiet \
+ && DEBIAN_FRONTEND=noninteractive apt install --yes --quiet \
+      python3.11 python3.11-venv python3.11-dev python3-pip \
+ && rm -rf /var/lib/apt/lists/*
+
+# 2).1 install uv
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates
+ADD https://astral.sh/uv/install.sh /uv-installer.sh
+RUN sh /uv-installer.sh && rm /uv-installer.sh
+ENV PATH="/root/.local/bin/:$PATH"
+
+
+# 3) Create a venv and update pip
+RUN python3.11 -m venv /alphafold3_venv
+ENV PATH="/alphafold3_venv/bin:$PATH"
+RUN pip install --upgrade pip
+
+# 4) Install HMMER (same as before)
+RUN mkdir /hmmer_build /hmmer \
+ && wget http://eddylab.org/software/hmmer/hmmer-3.4.tar.gz -P /hmmer_build \
+ && tar zxf /hmmer_build/hmmer-3.4.tar.gz -C /hmmer_build \
+ && (cd /hmmer_build/hmmer-3.4 && ./configure --prefix=/hmmer && make -j && make install) \
+ && (cd /hmmer_build/hmmer-3.4/easel && make install) \
+ && rm -rf /hmmer_build
+
+# 5) Copy AlphaFold 3 and set workdir
+COPY . /app/alphafold
+WORKDIR /app/alphafold
+
+
+# 6) Install your pinned stack (triton==3.3.0 & jax-triton==0.3.0)
+RUN uv pip install -r dev_requirements_cu129.txt \
+    && sed -i \
+         -e 's|from jax\.core import JaxprEqn|from jax.extend.core import JaxprEqn|' \
+         -e 's|jax\.core\.JaxprEqn|jax.extend.core.JaxprEqn|g' \
+         -e 's|jax\.core\.Var|jax.extend.core.Var|g' \
+         -e 's|jax\.core\.Jaxpr\b|jax.extend.core.Jaxpr|g' \
+         /alphafold3_venv/lib/python3.11/site-packages/haiku/_src/jaxpr_info.py \
+    && uv pip install --no-deps .
+
+# 7) Uninstall old Triton/JAX-Triton, then install Triton from source (release/3.3.x) & JAX-Triton@main
+RUN pip uninstall -y triton jax-triton \
+ && uv pip install --no-deps 'git+https://github.com/triton-lang/triton.git@release/3.3.x#egg=triton&subdirectory=python' \
+ && uv pip install git+https://github.com/jax-ml/jax-triton.git@main
+
+# 8) Build AlphaFold’s chemical database
+RUN build_data
+
+# To work around a known XLA issue causing the compilation time to greatly
+# increase, the following environment variable setting XLA flags must be enabled
+# when running AlphaFold 3. Note that if using CUDA capability 7 GPUs, it is
+# necessary to set the following XLA_FLAGS value instead:
+# ENV XLA_FLAGS="--xla_disable_hlo_passes=custom-kernel-fusion-rewriter"
+# (no need to disable gemm in that case as it is not supported for such GPU).
+# Memory settings used for folding up to 5,120 tokens on A100 80 GB.
+ENV XLA_FLAGS="--xla_gpu_enable_triton_gemm=false"
+ENV XLA_PYTHON_CLIENT_PREALLOCATE=true
+ENV XLA_CLIENT_MEM_FRACTION=0.95
+
+CMD ["python3", "run_alphafold.py"]
