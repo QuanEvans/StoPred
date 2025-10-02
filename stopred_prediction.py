@@ -382,6 +382,11 @@ def reformate_prediction(mean_results: Dict[str, Dict[str, str]], prediction_dic
             final_predictions[unique_id]['global_predictions'][name] = dict(sorted(final_predictions[unique_id]['global_predictions'][name].items(), key=lambda x: x[1], reverse=True))
         
         num_subunits = len(prediction_dict[unique_id])
+        # do not use the global prediction if is a homo oligomer
+        if num_subunits == 1:
+            pred_global_pairs = None
+            # pop the global prediction
+            final_predictions[unique_id].pop('global_predictions')
         pred_global_pairs = reformate_global_pred(y_hat_global, num_subunits, idx2sto)
         # topk predictions, only for yhat
         y_hat_slice = y_hat[:num_subunits]
