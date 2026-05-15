@@ -1,9 +1,9 @@
 [project]
-name = "stopred"
+name = "StoPred"
 version = "0.1.0"
-description = "Add your description here"
+description = "StoPred predicts protein complex stoichiometry from protein language model embeddings using graph attention networks."
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.12"
 dependencies = [
     "absl-py==2.2.2",
     "aiohappyeyeballs==2.6.1",
@@ -14,6 +14,7 @@ dependencies = [
     "biopython==1.85",
     "biotite==1.3.0",
     "biotraj==1.2.2",
+    "bitsandbytes==0.49.2",
     "Brotli==1.1.0",
     "certifi==2022.12.7",
     "charset-normalizer==2.1.1",
@@ -61,6 +62,7 @@ dependencies = [
     "pandas==2.2.3",
     "parso==0.8.4",
     "PDBeCif==1.5",
+    "peft==0.19.1",
     "pexpect==4.9.0",
     "pillow==11.0.0",
     "prompt_toolkit==3.0.51",
@@ -96,10 +98,21 @@ dependencies = [
     "typing_extensions==4.12.2",
     "tzdata==2025.2",
     "urllib3==1.26.13",
+    "wandb==0.19.11",
     "wcwidth==0.2.13",
     "yarl==1.20.0",
-    "zstd==1.5.7.0"
+    "zstd==1.5.7.0",
 ]
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["network", "utils"]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+torchaudio = { index = "pytorch-cu128" }
