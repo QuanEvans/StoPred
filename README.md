@@ -18,7 +18,36 @@ StoPred is a deep learning method for predicting the stoichiometry of protein co
 - Python 3.11 (the repo ships a `pyproject.toml` and `requirements.txt` capturing the tested dependency versions, including CUDA 12.8 builds of PyTorch).
 
 ## Installation
-Create a dedicated Conda environment and install the dependencies:
+
+### Option 1: Online server or CodeOcean capsule
+
+For users who do not want to install StoPred locally, we provide:
+
+- StoPred web server: https://seq2fun.dcmb.med.umich.edu/StoPred/
+- CodeOcean capsule: https://codeocean.com/capsule/7746930/tree
+
+No local installation is required when using the web server or CodeOcean capsule.
+
+### Option 2: Local installation with `uv` recommended
+
+Create a local Python 3.11 environment and install dependencies using `uv`:
+
+```bash
+uv sync
+source .venv/bin/activate
+```
+
+If `uv` is not installed:
+
+```bash
+pip install uv
+uv sync
+source .venv/bin/activate
+```
+
+The `pyproject.toml` file specifies the tested Python version and dependencies, including CUDA 12.8 PyTorch wheels.
+
+### Option 3: Local installation with Conda/pip
 
 ```bash
 conda create -n stopred python=3.11
@@ -26,7 +55,13 @@ conda activate stopred
 pip install -r requirements.txt
 ```
 
-> **Note:** `requirements.txt` pins GPU-enabled PyTorch packages. Adjust the CUDA wheels if you are targeting a different driver/toolkit combination.
+> **Note:** `requirements.txt` pins GPU-enabled PyTorch packages. Adjust the CUDA wheels if you are targeting a different CUDA driver/toolkit combination.
+
+### Typical installation time
+
+Using the CodeOcean capsule or a prepared Singularity/Apptainer container, setup takes less than 1 minute because the environment is already configured.
+
+For local installation with `uv` on a Linux workstation with CUDA-compatible drivers already available, environment setup is typically about 1 minute when packages are cached. A fresh installation may take longer depending on network speed.
 
 ## Data Preparation Workflow
 1. **Download mmCIF files** (PDB archive + obsolete list):
@@ -89,6 +124,7 @@ python train_sto_net.py \
 - `--output_dir` collects one checkpoint (`model_fold{k}.pkl`) per fold plus CSV reports.
 
 ## Inference on New Complexes
+
 `stopred_prediction.py` consumes a directory of FASTA files and exports JSON predictions:
 
 ```bash
@@ -101,14 +137,31 @@ python stopred_prediction.py \
     --device cuda
 ```
 
-- File names must match target IDs (e.g., `TargetID.fasta`). Sequence headers should be `target-id` pairs (target and chain labels separated by a dash).
+If using `uv`, the same command can be run as:
+
+```bash
+uv run python stopred_prediction.py \
+    casp_example/input_fasta \
+    casp_example/output_dir_pred \
+    --model_dir models_collection/default \
+    --topk 10 \
+    --alpha 0.7 \
+    --device cuda
+```
+
+- File names must match target IDs, for example `TargetID.fasta`.
+- Sequence headers should use target-chain labels separated by a dash.
 - The script creates ESM-C embeddings on demand; ensure the ESM-C weights remain accessible as described in the data section.
 - Output JSON files contain:
   - `chain_level_predictions`: per-chain copy-number distributions.
   - `global_predictions`: per-chain stoichiometry hypotheses aggregated across folds.
   - `topk_predictions`: highest-probability stoichiometry assignments with confidence scores.
 
-Compare outputs against `casp_example/output_dir` for expected structure.
+Compare outputs against `casp_example/output_dir` for the expected output structure.
+
+### Expected demo runtime
+
+The included CASP example demo is expected to finish in less than 1 minute on a CUDA-capable GPU after the model files and ESM-C weights are available. 
 
 ## Container Image
 - `container/singularity.def` document tested container images (CUDA 12.9). Adapt them to rebuild deterministic environments.
