@@ -227,7 +227,16 @@ def split_data_by_date(filter_data_noMonomer: dict) -> Tuple[dict, dict, dict]:
 
     seen_seq_sto: Dict[Tuple, List[str]] = {}
 
-    for pdb_id, pdb_dict in filter_data_noMonomer.items():
+    # Process oldest releases first so exact duplicate groups keep the training
+    # representative when one exists. Relying on JSON insertion order can let a
+    # newer val/test entry become the representative and hide an older train
+    # duplicate from leakage filtering.
+    ordered_items = sorted(
+        filter_data_noMonomer.items(),
+        key=lambda item: (item[1]["release_date"], item[0]),
+    )
+
+    for pdb_id, pdb_dict in ordered_items:
         key = create_sequence_stoichiometry_key(pdb_dict)
         is_duplicate = key in seen_seq_sto
         seen_seq_sto.setdefault(key, []).append(pdb_id)

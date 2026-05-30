@@ -14,6 +14,11 @@ from collections import Counter
 import pandas as pd
 from itertools import permutations
 
+def load_mapping(mapping_or_path):
+    if isinstance(mapping_or_path, (dict, ml_collections.ConfigDict)):
+        return dict(mapping_or_path)
+    return json.load(open(mapping_or_path))
+
 def get_mean_embedding(sequence: str, client=None) -> np.ndarray:
     """
     Get mean embedding for a sequence using ESM3.
@@ -67,9 +72,9 @@ def merge_features(
     """
     return_dataset = []
     num_subunits = config.model.num_subunits
-    sto2idx = json.load(open(config.model.sto2idx))
-    count2label = json.load(open(config.model.count2label))
-    label2idx = json.load(open(config.model.label2idx))
+    sto2idx = load_mapping(config.model.sto2idx)
+    count2label = load_mapping(config.model.count2label)
+    label2idx = load_mapping(config.model.label2idx)
     num_labels = len(label2idx)
 
     for sample in tqdm(dataset_list):
@@ -346,10 +351,13 @@ class StoInferenceDataset(Dataset):
 # utils for sto prediction
 def parse_sto(sto):
     if sto == 'other':
-        return 'ohter'
+        return 'other'
     sto = str(sto).replace('(', '').replace(')', '')
     sto_counts = [int(i) for i in sto.split(',') if i.strip()]
     return sto_counts
+
+def canonical_stoich(stoich):
+    return tuple(sorted((int(i) for i in stoich), reverse=True))
 
 def list2tagAlpha(label_list):
     tag = ''
@@ -368,7 +376,7 @@ def reformate_global_pred(pred_global, num_subunits, idx2sto):
     pred_global_pairs = [(parse_sto(k), v) for k, v in pred_global_dict.items()]
     return pred_global_pairs
 
-def top_k_stoichiometries_combined(prob_matrix, K, idx2label=None, pred_global_pairs=None, alpha=0.7):
+def top_k_stoichiometries_combined(prob_matrix, K, idx2label=None, pred_global_pairs=None, alpha=0.5):
     """
     Hybrid strategy for predicting stoichiometries using both global and chain-level predictions.
 
@@ -377,7 +385,7 @@ def top_k_stoichiometries_combined(prob_matrix, K, idx2label=None, pred_global_p
         K: number of top predictions to return
         idx2label: dict mapping column indices to stoichiometry labels
         pred_global_pairs: list of tuples (stoich_list, prob) from global predictions
-        alpha: weighting factor for combining global and chain-level scores (default: 0.7)
+        alpha: weighting factor for combining global and chain-level scores (default: 0.5)
 
     Returns:
         List of tuples: (combined_score, stoich_list)
@@ -406,9 +414,6 @@ def top_k_stoichiometries_combined(prob_matrix, K, idx2label=None, pred_global_p
         new_combos.sort(key=lambda x: x[0], reverse=True)
         current_top = new_combos[:K]
 
-    # no need to use global predictions if alpha is 0 or pred_global_pairs is None
-    if alpha == 0 or pred_global_pairs is None:
-        return current_top[:K]
     # ---- Scoring Helper ----
     def get_chain_log_score(perm):
         try:
@@ -427,20 +432,26 @@ def top_k_stoichiometries_combined(prob_matrix, K, idx2label=None, pred_global_p
         return np.log(combine)
         #return alpha * np.log(global_prob) + (1 - alpha) * chain_log_prob
 
+    # no need to use global predictions if alpha is 0 or pred_global_pairs is None
+    if alpha == 0 or pred_global_pairs is None:
+        return current_top[:K]
+
     # ---- Score Global Predictions ----
     all_predictions = []
     used_patterns = set()
     pred_global_dcit = dict()
-    min_score = 1e-12
+    other_score = 1e-12
     if pred_global_pairs:
-        pred_global_dcit = {tuple(stoich_list): global_prob for stoich_list, global_prob in pred_global_pairs}
-        non_zero_global_preds = [pred for pred in pred_global_pairs if pred[1] > 0]
-        min_score = min(non_zero_global_preds, key=lambda x: x[1])[1] * 0.99
-        # min_score = max(min_score, 1e-12)
+        for stoich_list, global_prob in pred_global_pairs:
+            global_prob = float(global_prob)
+            if stoich_list == 'other':
+                other_score = max(global_prob / max(n, 1), 1e-12)
+            elif stoich_list is not None and len(stoich_list) == n:
+                pred_global_dcit[canonical_stoich(stoich_list)] = global_prob
         for stoich_list, global_prob in pred_global_pairs[:K]:  # take top-N global predictions
-            if stoich_list == None:
+            if stoich_list is None or stoich_list == 'other':
                 continue
-            if len(stoich_list) != n or stoich_list == 'other' or len(stoich_list) == 1:
+            if len(stoich_list) != n or len(stoich_list) == 1:
                 continue
             best_perm = None
             best_chain_score = float('-inf')
@@ -458,11 +469,9 @@ def top_k_stoichiometries_combined(prob_matrix, K, idx2label=None, pred_global_p
     for chain_log_prob, stoich in current_top:
         if tuple(stoich) not in used_patterns:
             # get the global score,
-            tuple_sorted_stoich = tuple(sorted(stoich))
-            score = pred_global_dcit.get(tuple_sorted_stoich, min_score)
-            # if score is None:
-            #     score = pred_global_dcit.get(tuple('other'), 1e-6)
-            final_score = combined_score(score, chain_log_prob)  # small prob if no global info
+            tuple_sorted_stoich = canonical_stoich(stoich)
+            score = pred_global_dcit.get(tuple_sorted_stoich, other_score)
+            final_score = combined_score(score, chain_log_prob)
             all_predictions.append((final_score, stoich))
 
     # ---- Final Top-K Selection ----
@@ -474,7 +483,7 @@ def top_k_stoichiometries_combined(prob_matrix, K, idx2label=None, pred_global_p
     # all_predictions.insert(0, (top1_chain_pred_prob, top1_chain_pred_sto))
     return all_predictions[:K]
 
-def get_stopred_result_report(pred_dict, test_data, idx2label, idx2sto, alpha=0, min_support=1):
+def get_stopred_result_report(pred_dict, test_data, idx2label, idx2sto, alpha=0.5, min_support=10):
     test_name = []
     test_preds = []
     test_labels = []

@@ -1,6 +1,7 @@
 import os
 import pickle
 import argparse
+import copy
 from config import Config, config_dict
 from network.utils import merge_features, StoDataset
 from network.sto_net import StoPredNet
@@ -24,15 +25,78 @@ def create_parser():
     parser = argparse.ArgumentParser(description='Train StoNet')
     parser.add_argument('-features', '--features', type=str, nargs='+', default=['sequence'], help='Features to use', choices=['sequence', 'structure'])
     parser.add_argument('-data', '--data', type=str, help='dataset pkl path', default=os.path.join(project_root, 'Dataset', 'StoPredDataset.pkl'))
+    parser.add_argument('--sto2idx', type=str, default=Config.model.sto2idx, help='stoichiometry vocabulary JSON path')
+    parser.add_argument('--count2label', type=str, default=Config.model.count2label, help='copy-count-to-label JSON path')
+    parser.add_argument('--label2idx', type=str, default=Config.model.label2idx, help='copy-count label vocabulary JSON path')
+    parser.add_argument('--sequence-features', type=str, default=Config.data.sequenceFeaturesPath, help='sequence feature pickle path')
+    parser.add_argument('--structure-features', type=str, default=Config.data.structureFeaturesPath, help='structure feature pickle path')
+    parser.add_argument('--num-subunits', type=int, default=None, help='override Config.model.num_subunits for specialized models')
+    parser.add_argument(
+        '--local-class-weighting',
+        choices=['none', 'inverse', 'inverse_sqrt'],
+        default='none',
+        help='Apply copy-count class weights to the local cross-entropy loss.',
+    )
+    parser.add_argument(
+        '--local-class-weight-max',
+        type=float,
+        default=5.0,
+        help='Maximum local class weight after normalization. Use <=0 to disable clipping.',
+    )
+    parser.add_argument(
+        '--local-loss',
+        choices=['ce', 'focal'],
+        default='ce',
+        help='Local copy-count loss. Focal loss uses local class weights as alpha_t.',
+    )
+    parser.add_argument(
+        '--local-focal-gamma',
+        type=float,
+        default=2.0,
+        help='Gamma for local focal loss.',
+    )
+    parser.add_argument(
+        '--local-soft-f1-weight',
+        type=float,
+        default=0.0,
+        help='Weight for the local soft-F1 loss term over classes present in the batch.',
+    )
+    parser.add_argument(
+        '--local-soft-f1-mode',
+        choices=['multiply', 'add'],
+        default='multiply',
+        help='Combine local CE and soft-F1 loss as CE * (1 + weight * softF1Loss) or CE + weight * softF1Loss.',
+    )
     parser.add_argument('-seed', '--seed', type=int, default=None, help='overall seed, will override default seed in config')
     parser.add_argument('-o', '--output_dir', type=str, help='output directory that will store model and test results', required=True)
     parser.add_argument('--device', type=str, default='cuda', help='device to use for training, default is cuda')
     args = parser.parse_args()
     args.output_dir = os.path.abspath(args.output_dir)
+    args.data = os.path.abspath(args.data)
+    args.sto2idx = os.path.abspath(args.sto2idx)
+    args.count2label = os.path.abspath(args.count2label)
+    args.label2idx = os.path.abspath(args.label2idx)
+    args.sequence_features = os.path.abspath(args.sequence_features)
+    args.structure_features = os.path.abspath(args.structure_features)
     return args
 
 def load_pkl(path:str):
     return pickle.load(open(path, 'rb'))
+
+def load_json(path: str):
+    with open(path) as input_file:
+        return json.load(input_file)
+
+def make_training_config(args):
+    cfg = copy.deepcopy(Config)
+    if args.num_subunits is not None:
+        cfg.model.num_subunits = args.num_subunits
+    cfg.model.sto2idx = args.sto2idx
+    cfg.model.count2label = args.count2label
+    cfg.model.label2idx = args.label2idx
+    cfg.data.sequenceFeaturesPath = args.sequence_features
+    cfg.data.structureFeaturesPath = args.structure_features
+    return cfg
 
 def to_device(batch, device):
     out = {}
@@ -44,6 +108,44 @@ def to_device(batch, device):
         else:
             out[k] = v
     return out
+
+def local_label_index_for_count(count, count2label, label2idx):
+    count_key = str(count)
+    if count_key in count2label:
+        label = str(count2label[count_key])
+    else:
+        label = '-1'
+    return int(label2idx[label])
+
+def compute_local_class_weights(raw_samples, count2label, label2idx, scheme='none', max_weight=5.0):
+    if scheme == 'none':
+        return None
+    counts = np.zeros(len(label2idx), dtype=np.float64)
+    for sample in raw_samples:
+        entity_count = sample.get('entity_count', {})
+        for count in entity_count.values():
+            idx = local_label_index_for_count(count, count2label, label2idx)
+            counts[idx] += 1.0
+    observed = counts > 0
+    weights = np.ones(len(label2idx), dtype=np.float64)
+    if not np.any(observed):
+        return weights.tolist()
+    total = counts[observed].sum()
+    n_observed = observed.sum()
+    balanced = total / (n_observed * counts[observed])
+    if scheme == 'inverse_sqrt':
+        balanced = np.sqrt(balanced)
+    elif scheme != 'inverse':
+        raise ValueError(f'Unsupported local class weighting: {scheme}')
+    weights[observed] = balanced
+
+    # Keep the average loss scale close to the unweighted loss.
+    weighted_mean = float((counts[observed] * weights[observed]).sum() / total)
+    if weighted_mean > 0:
+        weights[observed] /= weighted_mean
+    if max_weight and max_weight > 0:
+        weights[observed] = np.minimum(weights[observed], float(max_weight))
+    return weights.astype(float).tolist()
 
 def main_crossval(args):
     # create output directory if not exists
@@ -58,6 +160,7 @@ def main_crossval(args):
     # set seed
     if args.seed is not None:
         Config.global_seed = args.seed
+    train_config = make_training_config(args)
     np.random.seed(Config.global_seed)
     torch.manual_seed(Config.global_seed)
     torch.cuda.manual_seed_all(Config.global_seed)
@@ -65,9 +168,9 @@ def main_crossval(args):
     sequenceFeatures = None
     structureFeatures = None
     if 'sequence' in args.features:
-        sequenceFeatures = load_pkl(Config.data.sequenceFeaturesPath)
+        sequenceFeatures = load_pkl(train_config.data.sequenceFeaturesPath)
     if 'structure' in args.features:
-        structureFeatures = load_pkl(Config.data.structureFeaturesPath)
+        structureFeatures = load_pkl(train_config.data.structureFeaturesPath)
     All_dataset = load_pkl(args.data)
 
     trainDatasetsRaw = list(All_dataset['train_data'].values())
@@ -78,9 +181,9 @@ def main_crossval(args):
     test_ids = set(All_dataset['test_data'].keys())
 
     # Merge features
-    trainDatasetsAll = merge_features(trainDatasetsRaw, sequenceFeatures, structureFeatures, Config)
-    valDatasetsAll = merge_features(valDatasetsRaw, sequenceFeatures, structureFeatures, Config)
-    testDatasets = merge_features(testDatasetsRaw, sequenceFeatures, structureFeatures, Config)
+    trainDatasetsAll = merge_features(trainDatasetsRaw, sequenceFeatures, structureFeatures, train_config)
+    valDatasetsAll = merge_features(valDatasetsRaw, sequenceFeatures, structureFeatures, train_config)
+    testDatasets = merge_features(testDatasetsRaw, sequenceFeatures, structureFeatures, train_config)
     allDatasets = trainDatasetsAll + valDatasetsAll + testDatasets
 
     test_dataset = StoDataset(testDatasets)
@@ -132,26 +235,50 @@ def main_crossval(args):
         
         feature_config_dict = dict()
         for feature in args.features:
-            feature_config_dict[feature] = {'dim': Config.model.embedding_dim[feature]}
+            feature_config_dict[feature] = {'dim': train_config.model.embedding_dim[feature]}
         print(feature_config_dict)
 
         model_config = ml_collections.ConfigDict({
-            'num_subunits': Config.model.num_subunits,
-            'dropout': Config.model.dropout,
-            'num_feature_layers': Config.model.num_feature_layers,
-            'num_gnn_layers': Config.model.num_gnn_layers,
+            'num_subunits': train_config.model.num_subunits,
+            'dropout': train_config.model.dropout,
+            'num_feature_layers': train_config.model.num_feature_layers,
+            'num_gnn_layers': train_config.model.num_gnn_layers,
             'features': feature_config_dict,
-            'hidden_dim': Config.model.hidden_dim,
-            'sto2idx': json.load(open(Config.model.sto2idx)),
-            'count2label': json.load(open(Config.model.count2label)),
-            'label2idx': json.load(open(Config.model.label2idx)),
-            'agg_methods': Config.model.agg_methods,
-            'use_moe': Config.model.use_moe,
-            'use_global_state': Config.model.use_global_state,
-            'learning_rate': Config.model.learning_rate,
-            'weight_local': Config.model.weight_local,
-            'weight_global': Config.model.weight_global,
+            'hidden_dim': train_config.model.hidden_dim,
+            'sto2idx': load_json(train_config.model.sto2idx),
+            'count2label': load_json(train_config.model.count2label),
+            'label2idx': load_json(train_config.model.label2idx),
+            'agg_methods': train_config.model.agg_methods,
+            'use_moe': train_config.model.use_moe,
+            'use_global_state': train_config.model.use_global_state,
+            'learning_rate': train_config.model.learning_rate,
+            'weight_local': train_config.model.weight_local,
+            'weight_global': train_config.model.weight_global,
+            'local_loss_type': args.local_loss,
+            'local_focal_gamma': args.local_focal_gamma,
+            'local_soft_f1_weight': args.local_soft_f1_weight,
+            'local_soft_f1_mode': args.local_soft_f1_mode,
         })
+        local_class_weights = compute_local_class_weights(
+            trainDatasetsRaw,
+            model_config['count2label'],
+            model_config['label2idx'],
+            scheme=args.local_class_weighting,
+            max_weight=args.local_class_weight_max,
+        )
+        if local_class_weights is not None:
+            model_config['local_class_weights'] = local_class_weights
+            idx2label = {int(value): key for key, value in model_config['label2idx'].items()}
+            class_weight_rows = [
+                {
+                    'label': idx2label[idx],
+                    'weight': float(weight),
+                }
+                for idx, weight in enumerate(local_class_weights)
+            ]
+            class_weight_path = os.path.join(args.output_dir, 'local_class_weights.csv')
+            pd.DataFrame(class_weight_rows).to_csv(class_weight_path, index=False)
+            print(f'Local class weights saved to {class_weight_path}')
         model = StoPredNet(model_config)
         model = model.to(device)
         monitor = 'val_loss'
@@ -223,4 +350,3 @@ if __name__ == '__main__':
     args = create_parser()
     main_crossval(args)
     
-

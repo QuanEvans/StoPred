@@ -5,11 +5,14 @@ import json
 import pickle
 
 root_dir = os.path.dirname(os.path.abspath(__file__))
+train_release_cutoff = "2026-01-01"
+train_release_tag = train_release_cutoff.replace("-", "")
+unknown_single_dataset_name = f"unk_single_{train_release_tag}"
 config_dict = {
     "global_seed": 1354,  # 4227
     "data": {
-        "cut_off_date": "2023-10-01",
-        "test_cut_off_date": "2024-05-01",
+        "cut_off_date": train_release_cutoff,
+        "test_cut_off_date": "2026-04-01",
         "Dataset": join(root_dir, "Dataset"),
         "processed_PDBmmcif_path": join(root_dir, "raw_data", "PDBmmcif.json"),
         "casp16_benchmark_path": join(root_dir, "raw_data", "casp16_benchmark.json"),
@@ -49,9 +52,27 @@ config_dict = {
         "min_epochs": 10,
         "max_epochs": 100,
     },
+    "unknown_single_sequence": {
+        "dataset_name": unknown_single_dataset_name,
+        "model_name": unknown_single_dataset_name,
+        "dataset_dir": join(root_dir, "Dataset", unknown_single_dataset_name),
+        "model_dir": join(root_dir, "models_collection", unknown_single_dataset_name),
+        "target_scope": "all",
+        "monomer_conflict_policy": "drop_existing_single_entity",
+        "merge_monomers_into_main_splits": True,
+        "local_class_weighting": "inverse_sqrt",
+        "local_class_weight_max": 5.0,
+        "local_loss": "ce",
+        "local_focal_gamma": 2.0,
+        "local_soft_f1_weight": 0.0,
+        "local_soft_f1_mode": "multiply",
+    },
     "inference": {
-        "alpha": 0.7,
-        "min_support": 1,
+        "alpha": 0.5,
+        "min_support": 10,
+        "model_root": join(root_dir, "models_collection"),
+        "default_model_release_prefix": "default",
+        "unknown_single_model_release_prefix": "unk_single",
     }
 }
 Config = ml_collections.ConfigDict(config_dict)

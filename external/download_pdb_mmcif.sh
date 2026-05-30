@@ -1,31 +1,19 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
-# Copyright 2021 DeepMind Technologies Limited
+# Download or update the wwPDB mmCIF archive in the native rsync layout.
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# Usage:
+#   bash external/download_pdb_mmcif.sh /path/to/download
 #
-#      http://www.apache.org/licenses/LICENSE-2.0
+# Output layout:
+#   /path/to/download/pdb_mmcif/divided/
+#   /path/to/download/pdb_mmcif/obsolete/
 #
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-#
-# Downloads, unzips and flattens the PDB database for AlphaFold.
-#
-# Usage: bash download_pdb_mmcif.sh /path/to/download/directory
-set -e
+# Files remain compressed as .cif.gz. Use parse_PDBmmcif_gz.py for parsing.
+set -euo pipefail
 
 if [[ $# -eq 0 ]]; then
     echo "Error: download directory must be provided as an input argument."
-    exit 1
-fi
-
-if ! command -v aria2c &> /dev/null ; then
-    echo "Error: aria2c could not be found. Please install aria2c (sudo apt install aria2)."
     exit 1
 fi
 
@@ -36,30 +24,36 @@ fi
 
 DOWNLOAD_DIR="$1"
 ROOT_DIR="${DOWNLOAD_DIR}/pdb_mmcif"
-RAW_DIR="${ROOT_DIR}/raw"
-MMCIF_DIR="${ROOT_DIR}/mmcif_files"
+DIVIDED_DIR="${ROOT_DIR}/divided"
+OBSOLETE_DIR="${ROOT_DIR}/obsolete"
 
-echo "Running rsync to fetch all mmCIF files (note that the rsync progress estimate might be inaccurate)..."
-echo "If the download speed is too slow, try changing the mirror to:"
-echo "  * rsync.ebi.ac.uk::pub/databases/pdb/data/structures/divided/mmCIF/ (Europe)"
-echo "  * ftp.pdbj.org::ftp_data/structures/divided/mmCIF/ (Asia)"
-echo "or see https://www.wwpdb.org/ftp/pdb-ftp-sites for more download options."
-mkdir --parents "${RAW_DIR}"
-rsync --recursive --links --perms --times --compress --info=progress2 --delete --port=33444 \
-  rsync.rcsb.org::ftp_data/structures/divided/mmCIF/ \
-  "${RAW_DIR}"
+PDB_PORT="${PDB_PORT:-33444}"
+PDB_SERVER="${PDB_SERVER:-rsync.rcsb.org::ftp}"
+PDB_RSYNC_ROOT="${PDB_RSYNC_ROOT:-${PDB_SERVER}/data/structures}"
 
-echo "Unzipping all mmCIF files..."
-find "${RAW_DIR}/" -type f -iname "*.gz" -exec gunzip {} +
+echo "Updating PDB mmCIF archive in: ${ROOT_DIR}"
+echo "Rsync root: ${PDB_RSYNC_ROOT}"
+echo "Port: ${PDB_PORT}"
+echo
+echo "If the download speed is too slow, try one of the wwPDB mirrors:"
+echo "  PDB_RSYNC_ROOT=rsync.ebi.ac.uk::pub/databases/pdb/data/structures"
+echo "  PDB_RSYNC_ROOT=ftp.pdbj.org::ftp_data/structures"
+echo "See https://www.wwpdb.org/ftp/pdb-ftp-sites for more options."
+echo
 
-echo "Flattening all mmCIF files..."
-mkdir --parents "${MMCIF_DIR}"
-find "${RAW_DIR}" -type d -empty -delete  # Delete empty directories.
-for subdir in "${RAW_DIR}"/*; do
-  mv "${subdir}/"*.cif "${MMCIF_DIR}"
-done
+mkdir -p "${DIVIDED_DIR}" "${OBSOLETE_DIR}"
 
-# Delete empty download directory structure.
-find "${RAW_DIR}" -type d -empty -delete
+echo "[1/2] Updating divided/mmCIF ..."
+rsync -rlpt -v -z --delete --port="${PDB_PORT}" \
+  "${PDB_RSYNC_ROOT}/divided/mmCIF/" \
+  "${DIVIDED_DIR}/"
 
-aria2c "https://files.wwpdb.org/pub/pdb/data/status/obsolete.dat" --dir="${ROOT_DIR}"
+echo
+echo "[2/2] Updating obsolete/mmCIF ..."
+rsync -rlpt -v -z --delete --port="${PDB_PORT}" \
+  "${PDB_RSYNC_ROOT}/obsolete/mmCIF/" \
+  "${OBSOLETE_DIR}/"
+
+echo
+echo "Done. Parse with:"
+echo "  python parse_PDBmmcif_gz.py ${ROOT_DIR} --exclude_obsolete -o raw_data/PDBmmcif.json"

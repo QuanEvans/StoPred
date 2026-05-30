@@ -312,6 +312,18 @@ class StoPredNet(pl.LightningModule):
         self.learning_rate = config.get('learning_rate', 0.0005)
         self.weight_local = config.get('weight_local', 0.5)
         self.weight_global = config.get('weight_global', 0.5)
+        self.local_loss_type = config.get('local_loss_type', 'ce')
+        self.local_focal_gamma = float(config.get('local_focal_gamma', 2.0))
+        self.local_soft_f1_weight = float(config.get('local_soft_f1_weight', 0.0))
+        self.local_soft_f1_mode = config.get('local_soft_f1_mode', 'multiply')
+        local_class_weights = config.get('local_class_weights', None)
+        if local_class_weights is None:
+            self.local_class_weights = None
+        else:
+            self.register_buffer(
+                'local_class_weights',
+                torch.tensor(local_class_weights, dtype=torch.float32),
+            )
         
         self.featuresBlock = nn.ModuleDict()
         for feature, params in self.features.items():
@@ -548,8 +560,46 @@ class StoPredNet(pl.LightningModule):
         valid_global_state = global_state_flat[mask_flat]
         valid_gt_global = gt_global_flat[mask_flat]
 
-        # Calculate losses using cross-entropy
-        local_loss = F.cross_entropy(valid_local_state, valid_gt_local, ignore_index=-100)
+        # Calculate local loss. Focal loss reuses local_class_weights as alpha_t.
+        local_loss_mask = valid_gt_local != -100
+        loss_local_state = valid_local_state[local_loss_mask]
+        loss_gt_local = valid_gt_local[local_loss_mask]
+        local_ce_loss = F.cross_entropy(
+            loss_local_state,
+            loss_gt_local,
+            weight=self.local_class_weights,
+        )
+        if self.local_loss_type == 'ce':
+            local_loss = local_ce_loss
+        elif self.local_loss_type == 'focal':
+            local_ce_per_sample = F.cross_entropy(
+                loss_local_state,
+                loss_gt_local,
+                weight=self.local_class_weights,
+                reduction='none',
+            )
+            local_probs = F.softmax(loss_local_state, dim=-1)
+            pt = local_probs.gather(1, loss_gt_local.unsqueeze(1)).squeeze(1)
+            focal_factor = (1 - pt).clamp(min=0, max=1).pow(self.local_focal_gamma)
+            local_loss = (focal_factor * local_ce_per_sample).mean()
+        else:
+            raise ValueError(f'Unsupported local_loss_type: {self.local_loss_type}')
+        if self.local_soft_f1_weight > 0:
+            local_probs = F.softmax(loss_local_state, dim=-1)
+            local_targets = F.one_hot(loss_gt_local, num_classes=local_probs.shape[-1]).to(local_probs.dtype)
+            true_support = local_targets.sum(dim=0)
+            present_class_mask = true_support > 0
+            tp = (local_probs * local_targets).sum(dim=0)
+            fp = (local_probs * (1 - local_targets)).sum(dim=0)
+            fn = ((1 - local_probs) * local_targets).sum(dim=0)
+            soft_f1 = (2 * tp + 1e-8) / (2 * tp + fp + fn + 1e-8)
+            soft_f1_loss = 1 - soft_f1[present_class_mask].mean()
+            if self.local_soft_f1_mode == 'add':
+                local_loss = local_ce_loss + self.local_soft_f1_weight * soft_f1_loss
+            elif self.local_soft_f1_mode == 'multiply':
+                local_loss = local_ce_loss * (1 + self.local_soft_f1_weight * soft_f1_loss)
+            else:
+                raise ValueError(f'Unsupported local_soft_f1_mode: {self.local_soft_f1_mode}')
         if not self.use_global_state:
             return local_loss
         
@@ -641,4 +691,3 @@ class StoPredNet(pl.LightningModule):
             'state_dict': self.state_dict()
         }
         torch.save(model_dict, filename)
-

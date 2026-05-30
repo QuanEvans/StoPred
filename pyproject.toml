@@ -1,6 +1,6 @@
 [project]
 name = "StoPred"
-version = "0.1.0"
+version = "1.0.0"
 description = "StoPred predicts protein complex stoichiometry from protein language model embeddings using graph attention networks."
 readme = "README.md"
 requires-python = ">=3.11,<3.12"

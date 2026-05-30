@@ -43,6 +43,11 @@ Thumbs.db
 data/
 models/
 results/
+local_experiments/
+models_collection/**
+!models_collection/
+!models_collection/README.md
+models_collection*.tar.*
 *.pkl
 *.pt
 *.pth

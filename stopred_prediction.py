@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from config import Config, config_dict
 from torch.utils.data import DataLoader
 import torch
+import re
 from network.utils import StoInferenceDataset
 from network.sto_net import StoPredNet
 from tqdm import tqdm
@@ -52,12 +53,254 @@ def read_input_dir(input_dir:str) -> Tuple[Dict[str, Dict[str, str]], Set[str]]:
         all_sequences.update(name2seq.values())
     return prediction_dict, all_sequences
 
+def normalize_release_tag(release_date: str) -> str:
+    """
+    Convert a release date such as 2026-01-01 or 20260101 to YYYYMMDD.
+    """
+    release_tag = str(release_date).strip().replace('-', '').replace('_', '').replace('.', '')
+    if len(release_tag) != 8 or not release_tag.isdigit():
+        raise ValueError(
+            f'Invalid --train-release-date: {release_date}. '
+            'Use YYYYMMDD or YYYY-MM-DD.'
+        )
+    return release_tag
+
+def release_tag_to_date(release_tag: str) -> str:
+    return f'{release_tag[:4]}-{release_tag[4:6]}-{release_tag[6:]}'
+
+def has_fold_models(model_dir: str, num_folds: int = None) -> bool:
+    if num_folds is None:
+        num_folds = Config.data.num_folds
+    if not os.path.isdir(model_dir):
+        return False
+    return all(
+        os.path.exists(os.path.join(model_dir, f'model_fold{fold}.pkl'))
+        for fold in range(num_folds)
+    )
+
+def release_tag_from_model_name(name: str, prefixes: List[str]):
+    for prefix in prefixes:
+        pattern = rf'^{re.escape(prefix)}[_-](\d{{8}})$'
+        match = re.match(pattern, name)
+        if match:
+            return match.group(1)
+    return None
+
+def validate_model_dir(model_dir: str, model_role: str) -> str:
+    model_dir = os.path.realpath(model_dir)
+    missing = [
+        f'model_fold{fold}.pkl'
+        for fold in range(Config.data.num_folds)
+        if not os.path.exists(os.path.join(model_dir, f'model_fold{fold}.pkl'))
+    ]
+    if missing:
+        raise FileNotFoundError(
+            f'{model_role} model directory is missing fold checkpoints: {model_dir}\n'
+            f'Missing: {", ".join(missing)}'
+        )
+    return model_dir
+
+def candidate_model_dirs(model_root: str, release_tag: str, model_role: str) -> List[str]:
+    model_root = os.path.realpath(model_root)
+    if model_role == 'default':
+        default_prefix = Config.inference.get('default_model_release_prefix', 'default')
+        names = [
+            f'{default_prefix}_{release_tag}',
+            f'stopred_{release_tag}',
+            'default',
+        ]
+    elif model_role == 'unknown_single':
+        unknown_prefix = Config.inference.get('unknown_single_model_release_prefix', 'unk_single')
+        names = [
+            f'{unknown_prefix}_{release_tag}',
+            f'unknown_single_{release_tag}',
+            f'unknown_single_sequence_{release_tag}',
+            'unknown_single_sequence',
+        ]
+        if release_tag == normalize_release_tag(Config.data.cut_off_date):
+            config_model_dir = os.path.realpath(Config.unknown_single_sequence.model_dir)
+            names.append(os.path.relpath(config_model_dir, model_root))
+    else:
+        raise ValueError(f'Unsupported model role: {model_role}')
+    return [os.path.join(model_root, name) for name in dict.fromkeys(names)]
+
+def release_model_prefixes(model_role: str) -> List[str]:
+    if model_role == 'default':
+        default_prefix = Config.inference.get('default_model_release_prefix', 'default')
+        return [default_prefix, 'stopred']
+    if model_role == 'unknown_single':
+        unknown_prefix = Config.inference.get('unknown_single_model_release_prefix', 'unk_single')
+        return [unknown_prefix, 'unknown_single', 'unknown_single_sequence']
+    raise ValueError(f'Unsupported model role: {model_role}')
+
+def available_release_models(model_root: str, model_role: str) -> Dict[str, str]:
+    model_root = os.path.realpath(model_root)
+    if not os.path.isdir(model_root):
+        raise FileNotFoundError(f'Model root does not exist: {model_root}')
+
+    models = {}
+    prefixes = release_model_prefixes(model_role)
+    for name in os.listdir(model_root):
+        path = os.path.join(model_root, name)
+        if not has_fold_models(path):
+            continue
+        release_tag = release_tag_from_model_name(name, prefixes)
+        if release_tag:
+            models[release_tag] = os.path.realpath(path)
+    return models
+
+def resolve_latest_model_dir(model_root: str, model_role: str):
+    models = available_release_models(model_root, model_role)
+    if not models:
+        return None, None
+    release_tag = sorted(models, reverse=True)[0]
+    return models[release_tag], release_tag
+
+def resolve_model_dir(
+    explicit_model_dir: str,
+    model_root: str,
+    release_tag: str,
+    model_role: str,
+) -> Tuple[str, str]:
+    if explicit_model_dir:
+        model_dir = validate_model_dir(explicit_model_dir, model_role)
+        explicit_tag = release_tag
+        if explicit_tag is None:
+            explicit_tag = release_tag_from_model_name(
+                os.path.basename(model_dir),
+                release_model_prefixes(model_role),
+            )
+        return model_dir, explicit_tag
+
+    if release_tag is None:
+        latest_model_dir, latest_release_tag = resolve_latest_model_dir(model_root, model_role)
+        if latest_model_dir is not None:
+            return latest_model_dir, latest_release_tag
+        if model_role == 'default':
+            fallback = os.path.join(os.path.realpath(model_root), 'default')
+            if has_fold_models(fallback):
+                return os.path.realpath(fallback), None
+        elif model_role == 'unknown_single':
+            fallback = os.path.join(os.path.realpath(model_root), 'unknown_single_sequence')
+            if has_fold_models(fallback):
+                return os.path.realpath(fallback), None
+        raise FileNotFoundError(
+            f'Could not resolve the latest {model_role} model in {os.path.realpath(model_root)}. '
+            'Use --train-release-date or an explicit model directory override.'
+        )
+
+    candidates = candidate_model_dirs(model_root, release_tag, model_role)
+    for candidate in candidates:
+        if has_fold_models(candidate):
+            return os.path.realpath(candidate), release_tag
+
+    formatted = '\n  '.join(os.path.realpath(candidate) for candidate in candidates)
+    raise FileNotFoundError(
+        f'Could not resolve a {model_role} model for release {release_tag_to_date(release_tag)}. '
+        f'Tried:\n  {formatted}\n'
+        'Use --model_dir for the default/heteromer model or --unk_model_dir for the unknown-single model.'
+    )
+
+def is_single_entity_target(name2seq: Dict[str, str]) -> bool:
+    return len(name2seq) == 1
+
+def plan_model_selection(args, prediction_dict: Dict[str, Dict[str, str]]):
+    if not prediction_dict:
+        raise ValueError(f'No FASTA targets found in {args.input_dir}')
+    requested_release_tag = normalize_release_tag(args.train_release_date) if args.train_release_date else None
+    release_tag = requested_release_tag
+    model_root = os.path.realpath(args.model_root)
+
+    target_is_single_entity = {
+        target_name: is_single_entity_target(name2seq)
+        for target_name, name2seq in prediction_dict.items()
+    }
+    needs_unknown_model = args.unk_for_homomer and any(target_is_single_entity.values())
+    needs_default_model = any(
+        (not is_single_entity) or (not args.unk_for_homomer)
+        for is_single_entity in target_is_single_entity.values()
+    )
+
+    if release_tag is None and needs_default_model and needs_unknown_model:
+        default_models = available_release_models(model_root, 'default')
+        unknown_models = available_release_models(model_root, 'unknown_single')
+        common_release_tags = sorted(set(default_models) & set(unknown_models), reverse=True)
+        if not common_release_tags:
+            raise FileNotFoundError(
+                f'Could not resolve a common latest release with both default and unknown-single models in {model_root}. '
+                'Use --train-release-date with a complete release, or pass --model_dir and --unk_model_dir explicitly.'
+            )
+        release_tag = common_release_tags[0]
+
+    default_model_dir = None
+    default_release_tag = None
+    if needs_default_model:
+        default_model_dir, default_release_tag = resolve_model_dir(
+            args.model_dir,
+            model_root,
+            release_tag,
+            'default',
+        )
+    unknown_model_dir = None
+    unknown_release_tag = None
+    if needs_unknown_model:
+        unknown_model_dir, unknown_release_tag = resolve_model_dir(
+            args.unk_model_dir,
+            model_root,
+            release_tag,
+            'unknown_single',
+        )
+
+    plan = {}
+    grouped_targets = {}
+    for target_name, name2seq in prediction_dict.items():
+        single_entity = target_is_single_entity[target_name]
+        if single_entity and args.unk_for_homomer:
+            model_role = 'unknown_single'
+            model_dir = unknown_model_dir
+        else:
+            model_role = 'default'
+            model_dir = default_model_dir
+        plan[target_name] = {
+            'model_role': model_role,
+            'model_dir': model_dir,
+            'single_entity_target': single_entity,
+            'train_release_date': release_tag_to_date(unknown_release_tag if model_role == 'unknown_single' else default_release_tag)
+                if (unknown_release_tag if model_role == 'unknown_single' else default_release_tag)
+                else None,
+        }
+        grouped_targets.setdefault(model_dir, []).append(target_name)
+
+    print('Model selection:')
+    if requested_release_tag:
+        print(f'  requested train release date: {release_tag_to_date(requested_release_tag)}')
+    elif release_tag:
+        print(f'  selected latest common train release date: {release_tag_to_date(release_tag)}')
+    else:
+        print('  requested train release date: latest available')
+    if needs_default_model:
+        default_release_text = release_tag_to_date(default_release_tag) if default_release_tag else 'unversioned'
+        print(f'  default model: {default_model_dir} ({default_release_text})')
+    else:
+        print('  default model: not needed for this input set')
+    if needs_unknown_model:
+        unknown_release_text = release_tag_to_date(unknown_release_tag) if unknown_release_tag else 'unversioned'
+        print(f'  unknown-single model: {unknown_model_dir} ({unknown_release_text})')
+    elif args.unk_for_homomer:
+        print('  unknown-single model: not needed for this input set')
+    else:
+        print('  unknown-single model: disabled; single-entity targets use the default model')
+    return plan, grouped_targets
+
 def parse_sto(sto):
     if sto == 'other':
-        return 'ohter'
+        return 'other'
     sto = str(sto).replace('(', '').replace(')', '')
     sto_counts = [int(i) for i in sto.split(',') if i.strip()]
     return sto_counts
+
+def canonical_stoich(stoich):
+    return tuple(sorted((int(i) for i in stoich), reverse=True))
 
 def reformate_global_pred(pred_global, num_subunits, idx2sto):
     pred_global_slice = pred_global[:num_subunits]
@@ -88,24 +331,24 @@ def generate_input_sequences_embeddings(sequences:Set[str], device:str) -> np.nd
     del client
     return features
 
-def prepare_stopred_input(prediction_dict:Dict[str, Dict[str, str]], sequenceFeatures:Dict[str, np.ndarray]) -> Dict[str, Dict[str, str]]:
-    orginal_num_subunits = Config.model.num_subunits
-    # check the max number of subunits in the prediction dict
+def prepare_stopred_input(
+    prediction_dict:Dict[str, Dict[str, str]],
+    sequenceFeatures:Dict[str, np.ndarray],
+    trained_num_subunits:int = None,
+) -> Dict[str, Dict[str, str]]:
+    trained_num_subunits = trained_num_subunits or Config.model.num_subunits
     max_num_subunits = max(len(v) for v in prediction_dict.values())
-    # override the max number of subunits in the config
-    Config.model.num_subunits = max_num_subunits
-
     inference_datasets = []
     for target_name, name2seq in prediction_dict.items():
         if len(name2seq) == 0:
             print(f"No sequences found for {target_name}")
             continue
-        elif len(name2seq) > orginal_num_subunits:
-            print(f"Number of sequences for {target_name} is greater than the max subunits number during training: {len(name2seq)} > {orginal_num_subunits}\n Eventhough the model can still make the prediction, it is not recommended.")
+        elif len(name2seq) > trained_num_subunits:
+            print(f"Number of sequences for {target_name} is greater than the max subunits number during training: {len(name2seq)} > {trained_num_subunits}\n Even though the model can still make the prediction, it is not recommended.")
             #continue
 
         input_sequences_features = np.zeros((max_num_subunits, Config.model.embedding_dim.sequence), dtype=np.float32)
-        mask = np.zeros(Config.model.num_subunits, dtype=np.float32)
+        mask = np.zeros(max_num_subunits, dtype=np.float32)
 
         skip = False
         for i, (name, seq) in enumerate(name2seq.items()):
@@ -173,6 +416,10 @@ def predict(model_dir:str, inference_dataloader:DataLoader, device:str) -> Dict[
         mean_results[unique_id]['y_hat_global'] /= num_folds
     return mean_results, label2idx, sto2idx
 
+def model_num_subunits(model_dir: str) -> int:
+    model = StoPredNet.load_from_pkl(os.path.join(model_dir, 'model_fold0.pkl'))
+    return int(model.num_subunits)
+
 def top_k_stoichiometries(prob_matrix, K, idx2label=None):
     """
     Finds the top K most likely stoichiometries (and their log-probabilities)
@@ -230,7 +477,7 @@ def top_k_stoichiometries(prob_matrix, K, idx2label=None):
     
     return current_top
 
-def top_k_stoichiometries_combined(prob_matrix, K, idx2label=None, pred_global_pairs=None, alpha=0.7):
+def top_k_stoichiometries_combined(prob_matrix, K, idx2label=None, pred_global_pairs=None, alpha=0.5):
     """
     Hybrid strategy for predicting stoichiometries using both global and chain-level predictions.
 
@@ -239,7 +486,7 @@ def top_k_stoichiometries_combined(prob_matrix, K, idx2label=None, pred_global_p
         K: number of top predictions to return
         idx2label: dict mapping column indices to stoichiometry labels
         pred_global_pairs: list of tuples (stoich_list, prob) from global predictions
-        alpha: weighting factor for combining global and chain-level scores (default: 0.7)
+        alpha: weighting factor for combining global and chain-level scores (default: 0.5)
 
     Returns:
         List of tuples: (combined_score, stoich_list)
@@ -268,9 +515,6 @@ def top_k_stoichiometries_combined(prob_matrix, K, idx2label=None, pred_global_p
         new_combos.sort(key=lambda x: x[0], reverse=True)
         current_top = new_combos[:K]
 
-    # no need to use global predictions if alpha is 0 or pred_global_pairs is None
-    if alpha == 0 or pred_global_pairs is None:
-        return current_top[:K]
     # ---- Scoring Helper ----
     def get_chain_log_score(perm):
         try:
@@ -289,20 +533,26 @@ def top_k_stoichiometries_combined(prob_matrix, K, idx2label=None, pred_global_p
         return np.log(combine)
         #return alpha * np.log(global_prob) + (1 - alpha) * chain_log_prob
 
+    # no need to use global predictions if alpha is 0 or pred_global_pairs is None
+    if alpha == 0 or pred_global_pairs is None:
+        return current_top[:K]
+
     # ---- Score Global Predictions ----
     all_predictions = []
     used_patterns = set()
     pred_global_dcit = dict()
-    min_score = 1e-12
+    other_score = 1e-12
     if pred_global_pairs:
-        pred_global_dcit = {tuple(stoich_list): global_prob for stoich_list, global_prob in pred_global_pairs}
-        non_zero_global_preds = [pred for pred in pred_global_pairs if pred[1] > 0]
-        min_score = min(non_zero_global_preds, key=lambda x: x[1])[1] * 0.99
-        # min_score = max(min_score, 1e-12)
+        for stoich_list, global_prob in pred_global_pairs:
+            global_prob = float(global_prob)
+            if stoich_list == 'other':
+                other_score = max(global_prob / max(n, 1), 1e-12)
+            elif stoich_list is not None and len(stoich_list) == n:
+                pred_global_dcit[canonical_stoich(stoich_list)] = global_prob
         for stoich_list, global_prob in pred_global_pairs[:K]:  # take top-N global predictions
-            if stoich_list == None:
+            if stoich_list is None or stoich_list == 'other':
                 continue
-            if len(stoich_list) != n or stoich_list == 'other' or len(stoich_list) == 1:
+            if len(stoich_list) != n or len(stoich_list) == 1:
                 continue
             best_perm = None
             best_chain_score = float('-inf')
@@ -320,11 +570,9 @@ def top_k_stoichiometries_combined(prob_matrix, K, idx2label=None, pred_global_p
     for chain_log_prob, stoich in current_top:
         if tuple(stoich) not in used_patterns:
             # get the global score,
-            tuple_sorted_stoich = tuple(sorted(stoich))
-            score = pred_global_dcit.get(tuple_sorted_stoich, min_score)
-            # if score is None:
-            #     score = pred_global_dcit.get(tuple('other'), 1e-6)
-            final_score = combined_score(score, chain_log_prob)  # small prob if no global info
+            tuple_sorted_stoich = canonical_stoich(stoich)
+            score = pred_global_dcit.get(tuple_sorted_stoich, other_score)
+            final_score = combined_score(score, chain_log_prob)
             all_predictions.append((final_score, stoich))
 
     # ---- Final Top-K Selection ----
@@ -387,7 +635,8 @@ def reformate_prediction(mean_results: Dict[str, Dict[str, str]], prediction_dic
             pred_global_pairs = None
             # pop the global prediction
             final_predictions[unique_id].pop('global_predictions')
-        pred_global_pairs = reformate_global_pred(y_hat_global, num_subunits, idx2sto)
+        else:
+            pred_global_pairs = reformate_global_pred(y_hat_global, num_subunits, idx2sto)
         # topk predictions, only for yhat
         y_hat_slice = y_hat[:num_subunits]
         topk_predictions = top_k_stoichiometries_combined(y_hat_slice, topk, idx2label, pred_global_pairs, alpha)
@@ -403,14 +652,34 @@ def reformate_prediction(mean_results: Dict[str, Dict[str, str]], prediction_dic
 def main(args):
     # read the input fasta files
     prediction_dict, all_sequences = read_input_dir(args.input_dir)
+    model_plan, grouped_targets = plan_model_selection(args, prediction_dict)
     # generate the embeddings
     sequenceFeatures = generate_input_sequences_embeddings(all_sequences, args.device)
-    # prepare the inference dataloader
-    inference_dataloader = prepare_stopred_input(prediction_dict, sequenceFeatures)
-    # predict
-    mean_result, label2idx, sto2idx = predict(args.model_dir, inference_dataloader, args.device)
-    # reformat the prediction
-    final_predictions = reformate_prediction(mean_result, prediction_dict, args.topk, args.alpha, label2idx, sto2idx)
+    final_predictions = {}
+    for model_dir, target_names in grouped_targets.items():
+        group_prediction_dict = {
+            target_name: prediction_dict[target_name]
+            for target_name in target_names
+        }
+        trained_num_subunits = model_num_subunits(model_dir)
+        inference_dataloader = prepare_stopred_input(
+            group_prediction_dict,
+            sequenceFeatures,
+            trained_num_subunits=trained_num_subunits,
+        )
+        mean_result, label2idx, sto2idx = predict(model_dir, inference_dataloader, args.device)
+        group_predictions = reformate_prediction(
+            mean_result,
+            group_prediction_dict,
+            args.topk,
+            args.alpha,
+            label2idx,
+            sto2idx,
+        )
+        for target_name, result in group_predictions.items():
+            result['model_selection'] = model_plan[target_name]
+            final_predictions[target_name] = result
+
     # save the prediction
     for target_name, result in final_predictions.items():
         with open(os.path.join(args.output_dir, f'{target_name}.json'), 'w') as f:
@@ -419,18 +688,55 @@ def main(args):
 
 if __name__ == "__main__":
     root_dir = os.path.dirname(os.path.abspath(__file__))
-    default_model_dir = os.path.join(root_dir, "models")
+    default_model_root = Config.inference.get('model_root', os.path.join(root_dir, "models_collection"))
     parser = argparse.ArgumentParser()
     parser.add_argument("input_dir", type=str, help="Path to the input directory that contains the fasta files")
     parser.add_argument("output_dir", type=str, help="Path to the output directory")
     parser.add_argument("--topk", type=int, default=10, help="Number of top K stoichiometries to predict")
-    parser.add_argument("--model_dir", type=str, default=default_model_dir, help="Path to the model directory")
+    parser.add_argument(
+        "--train-release-date",
+        type=str,
+        default=None,
+        help="Optional training release cutoff used to resolve release-specific model names. If omitted, use the latest available release-tagged model.",
+    )
+    parser.add_argument(
+        "--model-root",
+        type=str,
+        default=default_model_root,
+        help="Root directory containing release-specific model directories",
+    )
+    parser.add_argument(
+        "--model_dir",
+        "--model-dir",
+        type=str,
+        default=None,
+        help="Override default/heteromer model directory. If omitted, resolve from --model-root and --train-release-date.",
+    )
+    parser.add_argument(
+        "--unk_model_dir",
+        "--unk-model-dir",
+        type=str,
+        default=None,
+        help="Override unknown-single model directory used when -unk is enabled.",
+    )
+    parser.add_argument(
+        "-unk",
+        "--unk-for-homomer",
+        "--use-unk-for-homomer",
+        action="store_true",
+        dest="unk_for_homomer",
+        help="Use the unknown-single model for single-entity targets. Heteromer targets always use the default release model.",
+    )
     parser.add_argument('--device', type=str, default='cuda', help='Device to run the model on')
-    parser.add_argument('--alpha', type=float, default=0.7, help='Alpha for the combined strategy')
+    parser.add_argument('--alpha', type=float, default=Config.inference.alpha, help='Alpha for the combined strategy')
     args = parser.parse_args()
     args.input_dir = os.path.realpath(args.input_dir)
     args.output_dir = os.path.realpath(args.output_dir)
-    args.model_dir = os.path.realpath(args.model_dir)
+    args.model_root = os.path.realpath(args.model_root)
+    if args.model_dir:
+        args.model_dir = os.path.realpath(args.model_dir)
+    if args.unk_model_dir:
+        args.unk_model_dir = os.path.realpath(args.unk_model_dir)
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
     main(args)

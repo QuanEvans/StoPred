@@ -1,4 +1,5 @@
 import os
+from collections import defaultdict
 
 # required categories
 onlyCategories=['_citation','_entity','_entity_poly','_struct_ref','_struct', '_struct_keywords','_pdbx_struct_assembly','_pdbx_struct_assembly_gen','_pdbx_struct_assembly_auth_evidence','_struct_asym']
@@ -188,9 +189,10 @@ class PDBCif(object):
                 struct_ref = {k:[v] for k, v in struct_ref.items()}
             struct_ref_dict = dict()
             for i in range(len(struct_ref['id'])):
-                struct_ref_dict[struct_ref['id'][i]] = {
+                entity_id = struct_ref['entity_id'][i]
+                struct_ref_dict[entity_id] = {
                     'id': struct_ref['id'][i],
-                    'entity_id': struct_ref['entity_id'][i],
+                    'entity_id': entity_id,
                     'db_name': struct_ref['db_name'][i],
                     'db_code': struct_ref['db_code'][i],
                     'pdbx_db_accession': struct_ref['pdbx_db_accession'][i],
@@ -200,6 +202,84 @@ class PDBCif(object):
         except Exception as e:
             print(f'Error: {e} - {self.pdb_id} in parse_struct_ref()')
             return dict()
+
+    def _entity_merge_key(self, entity_id: str, seq_dict: dict, struct_ref_dict: dict):
+        seq_info = seq_dict.get(entity_id, {})
+        ref_info = struct_ref_dict.get(entity_id, {})
+        return (
+            seq_info.get('type'),
+            seq_info.get('sequence'),
+            ref_info.get('db_name'),
+            ref_info.get('db_code'),
+            ref_info.get('pdbx_db_accession'),
+        )
+
+    def _merge_exact_duplicate_entities(
+        self,
+        entity_count: dict,
+        seq_dict: dict,
+        struct_ref_dict: dict,
+    ):
+        groups = defaultdict(list)
+        for entity_id in entity_count:
+            groups[self._entity_merge_key(entity_id, seq_dict, struct_ref_dict)].append(entity_id)
+
+        merged_count = {}
+        merge_groups = {}
+        for members in groups.values():
+            representative = members[0]
+            merged_count[representative] = sum(int(entity_count[entity_id]) for entity_id in members)
+            if len(members) > 1:
+                merge_groups[representative] = members
+
+        return merged_count, merge_groups
+
+    def _entity_count_identity_key(self, entity_count: dict, seq_dict: dict, struct_ref_dict: dict):
+        def sortable_item(item):
+            merge_key, count = item
+            sortable_key = tuple('' if value is None else str(value) for value in merge_key)
+            return sortable_key + (int(count),)
+
+        identity_items = [
+            (
+                self._entity_merge_key(entity_id, seq_dict, struct_ref_dict),
+                int(count),
+            )
+            for entity_id, count in entity_count.items()
+        ]
+        return tuple(sorted(identity_items, key=sortable_item))
+
+    def _build_entity_record(
+        self,
+        representative_entity_id: str,
+        member_entity_ids: list,
+        count: int,
+        seq_dict: dict,
+        struct_ref_dict: dict,
+    ):
+        entity_record = {
+            'entity_id': representative_entity_id,
+            'count': count,
+            'sequence': seq_dict[representative_entity_id]['sequence'],
+            'type': seq_dict[representative_entity_id]['type'],
+            'strand_id': [
+                strand_id
+                for entity_id in member_entity_ids
+                for strand_id in seq_dict[entity_id]['strand_id']
+            ],
+        }
+        if len(member_entity_ids) > 1:
+            entity_record['member_entity_ids'] = member_entity_ids
+
+        if representative_entity_id in struct_ref_dict:
+            entity_record['db_name'] = struct_ref_dict[representative_entity_id]['db_name']
+            entity_record['db_code'] = struct_ref_dict[representative_entity_id]['db_code']
+            entity_record['pdbx_db_accession'] = struct_ref_dict[representative_entity_id]['pdbx_db_accession']
+        else:
+            entity_record['db_name'] = None
+            entity_record['db_code'] = None
+            entity_record['pdbx_db_accession'] = None
+        return entity_record
     
     def parse_assembly(self, chain2entity:dict=None):
         """
@@ -266,35 +346,41 @@ class PDBCif(object):
         struct_ref_dict = self.parse_struct_ref()
         assembly = self.parse_assembly(chain2entity=chain2entity)
         assembly_dict = dict()
+        present_normalized_sto = set()
         for k,v in assembly.items():
             unique_id = f'{self.pdb_id}_{k}'
+            raw_entity_count = v['chain2count']
+            entity_count, merge_groups = self._merge_exact_duplicate_entities(
+                raw_entity_count,
+                seq_dict,
+                struct_ref_dict,
+            )
+            normalized_sto = self._entity_count_identity_key(entity_count, seq_dict, struct_ref_dict)
+            if normalized_sto in present_normalized_sto:
+                continue
+            present_normalized_sto.add(normalized_sto)
             assembly_dict[unique_id] = {
                 'unique_id': unique_id,
                 'pdb_pubmed_id': self.pubmed_id,
-                'entity_count': v['chain2count'],
+                'entity_count': entity_count,
                 'details': v['details'],
                 'method_details': v['method_details'],
                 'experimental_support': v['experimental_support'] if 'experimental_support' in v else None,
                 'release_date': self.release_date,
             }
-            for entity_id in v['chain2count']:
-                if entity_id not in assembly_dict[unique_id]:
-                    assembly_dict[unique_id][entity_id] = {
-                        'entity_id': entity_id,
-                        'count': v['chain2count'][entity_id],
-                        'sequence': seq_dict[entity_id]['sequence'],
-                        'type': seq_dict[entity_id]['type'],
-                        'strand_id': seq_dict[entity_id]['strand_id'],
-                        # 'struct_ref_info': struct_ref_dict[entity_id] if entity_id in struct_ref_dict else None,
-                    }
-                    if entity_id in struct_ref_dict:
-                        assembly_dict[unique_id][entity_id]['db_name'] = struct_ref_dict[entity_id]['db_name']
-                        assembly_dict[unique_id][entity_id]['db_code'] = struct_ref_dict[entity_id]['db_code']
-                        assembly_dict[unique_id][entity_id]['pdbx_db_accession'] = struct_ref_dict[entity_id]['pdbx_db_accession']
-                    else:
-                        assembly_dict[unique_id][entity_id]['db_name'] = None
-                        assembly_dict[unique_id][entity_id]['db_code'] = None
-                        assembly_dict[unique_id][entity_id]['pdbx_db_accession'] = None
+            if merge_groups:
+                assembly_dict[unique_id]['raw_entity_count'] = raw_entity_count
+                assembly_dict[unique_id]['entity_merge_groups'] = merge_groups
+                assembly_dict[unique_id]['entity_merge_strategy'] = 'exact_sequence_and_identifiers'
+            for entity_id, count in entity_count.items():
+                member_entity_ids = merge_groups.get(entity_id, [entity_id])
+                assembly_dict[unique_id][entity_id] = self._build_entity_record(
+                    entity_id,
+                    member_entity_ids,
+                    count,
+                    seq_dict,
+                    struct_ref_dict,
+                )
             assembly_dict[unique_id]['stoichiometry'] = self.entity_count_2_stoichiometry(assembly_dict[unique_id]['entity_count'])
         return assembly_dict
     
